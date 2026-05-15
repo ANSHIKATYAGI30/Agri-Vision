@@ -138,6 +138,6 @@ See the `LICENSE` file for more details.
 
 **Made with ❤️ by the neeru24**
 
-⭐ **Don't forget to star this repo if you found it helpful!** ⭐
+⭐ **Don't forget to star this repo if you found it helpful.** ⭐
 
 </div>
