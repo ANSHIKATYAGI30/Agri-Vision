@@ -11,8 +11,7 @@ import uuid
 from datetime import datetime
 import tensorflow as tf
 from tensorflow import keras
-import json
-
+import json
 app = Flask(__name__)
 app.secret_key = 'agri-vision-secret-key-2024'
 app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024  # 10MB max
