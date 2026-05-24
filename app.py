@@ -1,11 +1,14 @@
 """
 Agri-Vision Flask Application
 Unified inference for disease classification (ResNet50) and growth stage prediction (YOLOv8)
+Thread-safe execution for production environments.
 """
 import json
 import logging
 import os
+import threading
 from datetime import datetime
+from typing import Any, Dict, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -14,11 +17,11 @@ import torch.nn.functional as F
 from dotenv import load_dotenv
 from flasgger import Swagger
 from flask import Flask, flash, jsonify, redirect, render_template, request, url_for
-from jinja2 import Environment, FileSystemLoader
 from PIL import Image
 from torchvision import transforms
 from ultralytics import YOLO
 from werkzeug.utils import secure_filename
+
 from services.weather_service import get_weather, geocode_city, generate_weather_recommendations
 
 load_dotenv()
@@ -31,15 +34,11 @@ swagger = Swagger(app)
 
 app.config["TEMPLATES_AUTO_RELOAD"] = True
 app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
-
 app.jinja_env.auto_reload = True
 app.jinja_env.cache = {}
 
-secret_key = os.getenv("SECRET_KEY")
-if not secret_key:
-    secret_key = "dev_secret_123"
+secret_key = os.getenv("SECRET_KEY", "dev_secret_123")
 app.secret_key = secret_key
-
 app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024
 
 LANG = {
@@ -55,6 +54,9 @@ ALLOWED_IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "gif"}
 MAX_INFERENCE_DIMENSION = 1024
 DISPLAY_IMAGE_MAX_DIMENSION = 1200
 DISPLAY_JPEG_QUALITY = 80
+
+RESNET_MODEL_PATH = "models/cotton_crop_disease_classification/full_resnet50_model.pth"
+YOLO_MODEL_PATH = "models/cotton_crop_growth_stage_prediction/best.pt"
 
 disease_classes = [
     "Aphids",  
@@ -75,46 +77,102 @@ growth_stage_classes = [
     "Split Cotton Boll",  
 ]
 
-resnet_model = None
-yolo_model = None
+# -------------------------------------------------------------------
+# THREAD-SAFE MODEL MANAGER (Your advanced PR implementation)
+# -------------------------------------------------------------------
+class ModelManager:
+    _instance = None
+    _instance_lock = threading.Lock()
 
+    def __new__(cls):
+        if cls._instance is None:
+            with cls._instance_lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __init__(self):
+        if getattr(self, "_initialized", False):
+            return
+        self._load_lock = threading.Lock()
+        self.loaded = False
+        self.errors = {"resnet": None, "yolo": None}
+        self.resnet_model = None
+        self.yolo_model = None
+        self._initialized = True
+
+    def load_models(self) -> Tuple[Optional[torch.nn.Module], Optional[YOLO]]:
+        if self.loaded:
+            return self.resnet_model, self.yolo_model
+
+        with self._load_lock:
+            if self.loaded:
+                return self.resnet_model, self.yolo_model
+
+            if self.resnet_model is None:
+                try:
+                    self.resnet_model = torch.load(
+                        RESNET_MODEL_PATH,
+                        map_location=torch.device("cpu"),
+                        weights_only=False
+                    )
+                    self.resnet_model.eval()
+                    self.errors["resnet"] = None
+                    logger.info("ResNet50 model loaded successfully")
+                except Exception as exc:
+                    self.errors["resnet"] = str(exc)
+                    logger.warning(f"ResNet50 model not found or failed to load: {exc}")
+                    self.resnet_model = None
+
+            if self.yolo_model is None:
+                try:
+                    self.yolo_model = YOLO(YOLO_MODEL_PATH)
+                    self.errors["yolo"] = None
+                    logger.info("YOLOv8 model loaded successfully")
+                except Exception as exc:
+                    self.errors["yolo"] = str(exc)
+                    logger.warning(f"YOLOv8 model not found or failed to load: {exc}")
+                    self.yolo_model = None
+
+            self.loaded = True
+            return self.resnet_model, self.yolo_model
+
+    def diagnostics(self) -> Dict[str, Any]:
+        return {
+            "resnet": {
+                "loaded": self.resnet_model is not None,
+                "path": RESNET_MODEL_PATH,
+                "error": self.errors.get("resnet"),
+            },
+            "yolo": {
+                "loaded": self.yolo_model is not None,
+                "path": YOLO_MODEL_PATH,
+                "error": self.errors.get("yolo"),
+            },
+        }
+
+model_manager = ModelManager()
 
 def load_models():
-    global resnet_model, yolo_model
-    if resnet_model is None:
-        try:
-            resnet_model = torch.load(
-                "models/cotton_crop_disease_classification/full_resnet50_model.pth",
-                map_location=torch.device("cpu"),
-            )
-            logger.info("ResNet50 model loaded successfully")
-        except Exception as e:
-            logger.warning(f"ResNet50 model not found or failed to load: {e}")
-            resnet_model = None
-    if yolo_model is None:
-        try:
-            yolo_model = YOLO("models/cotton_crop_growth_stage_prediction/best.pt")
-            logger.info("YOLOv8 model loaded successfully")
-        except Exception as e:
-            logger.warning(f"YOLOv8 model not found or failed to load: {e}")
-            yolo_model = None
-    return resnet_model, yolo_model
+    """Wrapper for backward compatibility"""
+    return model_manager.load_models()
 
-
+# -------------------------------------------------------------------
+# INFERENCE PIPELINE
+# -------------------------------------------------------------------
 def preprocess_image_for_resnet(image, target_size=(224, 224)):
-    transform = transforms.Compose(
-        [
-            transforms.ToPILImage(),
-            transforms.Resize(target_size),
-            transforms.ToTensor(),
-        ]
-    )
+    transform = transforms.Compose([
+        transforms.ToPILImage(),
+        transforms.Resize(target_size),
+        transforms.ToTensor(),
+    ])
     image = transform(image)
     image = image.unsqueeze(0)
     return image
 
-
 def infer_disease(image):
+    resnet_model, _ = model_manager.load_models()
+    
     if resnet_model:
         processed = preprocess_image_for_resnet(image)
         with torch.no_grad():
@@ -135,7 +193,7 @@ def infer_disease(image):
         disease_classes[i]: float(probs_np[0][i]) for i in range(len(disease_classes))
     }
 
-    results = {
+    return {
         "predicted_class": disease_classes[class_idx],
         "predicted_class_idx": class_idx,
         "confidence": float(probs_np[0][class_idx]),
@@ -143,10 +201,9 @@ def infer_disease(image):
         "health_score": health_score,
         "raw": probs_np.tolist(),
     }
-    return results
-
 
 def infer_growth_stage(image):
+    _, yolo_model = model_manager.load_models()
     result = {
         "main_class": None,
         "main_class_idx": None,
@@ -161,79 +218,38 @@ def infer_growth_stage(image):
         for r in yolo_results:
             if hasattr(r, "boxes"):
                 for b in r.boxes:
-                    class_id = (
-                        int(b.cls[0].item())
-                        if hasattr(b.cls[0], "item")
-                        else int(b.cls[0])
-                    )
-                    conf = (
-                        float(b.conf[0].item())
-                        if hasattr(b.conf[0], "item")
-                        else float(b.conf[0])
-                    )
+                    class_id = int(b.cls[0].item()) if hasattr(b.cls[0], "item") else int(b.cls[0])
+                    conf = float(b.conf[0].item()) if hasattr(b.conf[0], "item") else float(b.conf[0])
                     xyxy = b.xyxy[0].cpu().numpy().tolist()
-                    boxes.append(
-                        {
-                            "class_id": class_id,
-                            "class_name": growth_stage_classes[class_id]
-                            if class_id < len(growth_stage_classes)
-                            else str(class_id),
-                            "confidence": conf,
-                            "bbox": xyxy,
-                        }
-                    )
-            else:
-                continue
+                    boxes.append({
+                        "class_id": class_id,
+                        "class_name": growth_stage_classes[class_id] if class_id < len(growth_stage_classes) else str(class_id),
+                        "confidence": conf,
+                        "bbox": xyxy,
+                    })
         if len(boxes):
             main = max(boxes, key=lambda x: x["confidence"])
-            result.update(
-                {
-                    "main_class": main["class_name"],
-                    "main_class_idx": main["class_id"],
-                    "confidence": main["confidence"],
-                }
-            )
+            result.update({
+                "main_class": main["class_name"],
+                "main_class_idx": main["class_id"],
+                "confidence": main["confidence"],
+            })
             result["boxes"] = boxes
         result["raw"] = boxes
     return result
-
 
 def generate_recommendations(disease_result, growth_result, weather=None):
     recs = []
     dclass = disease_result["predicted_class"]
     instr_map = {
-        "Aphids": [
-            "Inspect leaves closely for clusters of small pests.",
-            "Use recommended insecticides if infestation is severe.",
-        ],
-        "Army worm": [
-            "Increase scouting frequency.",
-            "Apply biological or suitable chemical controls early.",
-        ],
-        "Bacterial blight": [
-            "Avoid overhead irrigation.",
-            "Remove and destroy affected plant parts.",
-        ],
-        "Cotton Boll Rot": [
-            "Improve field drainage, avoid stagnant water.",
-            "Remove and destroy rotten bolls.",
-        ],
-        "Green Cotton Boll": [
-            "Monitor bolls for signs of pests or disease.",
-            "Maintain optimal nutrient regime.",
-        ],
-        "Healthy": [
-            "Continue general crop monitoring.",
-            "Maintain optimal fertilization and irrigation.",
-        ],
-        "Powdery mildew": [
-            "Remove infected plant debris.",
-            "Apply fungicide at recommended intervals.",
-        ],
-        "Target Spot": [
-            "Monitor for spread, reduce leaf wetness.",
-            "Apply suitable fungicide if required.",
-        ],
+        "Aphids": ["Inspect leaves closely for clusters of small pests.", "Use recommended insecticides if infestation is severe."],
+        "Army worm": ["Increase scouting frequency.", "Apply biological or suitable chemical controls early."],
+        "Bacterial blight": ["Avoid overhead irrigation.", "Remove and destroy affected plant parts."],
+        "Cotton Boll Rot": ["Improve field drainage, avoid stagnant water.", "Remove and destroy rotten bolls."],
+        "Green Cotton Boll": ["Monitor bolls for signs of pests or disease.", "Maintain optimal nutrient regime."],
+        "Healthy": ["Continue general crop monitoring.", "Maintain optimal fertilization and irrigation."],
+        "Powdery mildew": ["Remove infected plant debris.", "Apply fungicide at recommended intervals."],
+        "Target Spot": ["Monitor for spread, reduce leaf wetness.", "Apply suitable fungicide if required."],
     }
     recs.extend(instr_map.get(dclass, ["Practice general crop hygiene."]))
  
@@ -244,23 +260,11 @@ def generate_recommendations(disease_result, growth_result, weather=None):
  
     gmain = growth_result.get("main_class", None)
     grow_map = {
-        "Cotton Blossom": [
-            "Maintain regular watering during blossom phase.",
-            "Scout for early flower pests.",
-        ],
+        "Cotton Blossom": ["Maintain regular watering during blossom phase.", "Scout for early flower pests."],
         "Cotton Bud": ["Ensure adequate phosphorus supply.", "Monitor for budworm."],
-        "Early Boll": [
-            "Start borer management as boll phase begins.",
-            "Avoid excess nitrogen at this stage.",
-        ],
-        "Matured Cotton Boll": [
-            "Reduce irrigation to harden bolls.",
-            "Plan for harvest in coming weeks.",
-        ],
-        "Split Cotton Boll": [
-            "Prepare for immediate harvest.",
-            "Avoid rainfall exposure to split bolls.",
-        ],
+        "Early Boll": ["Start borer management as boll phase begins.", "Avoid excess nitrogen at this stage."],
+        "Matured Cotton Boll": ["Reduce irrigation to harden bolls.", "Plan for harvest in coming weeks."],
+        "Split Cotton Boll": ["Prepare for immediate harvest.", "Avoid rainfall exposure to split bolls."],
     }
     if gmain in grow_map:
         recs.extend(grow_map[gmain])
@@ -271,7 +275,6 @@ def generate_recommendations(disease_result, growth_result, weather=None):
  
     return recs[:6]
 
-
 def resize_image(image, max_dim=MAX_INFERENCE_DIMENSION):
     height, width = image.shape[:2]
     if max(height, width) <= max_dim:
@@ -279,7 +282,6 @@ def resize_image(image, max_dim=MAX_INFERENCE_DIMENSION):
     scale = max_dim / float(max(height, width))
     new_size = (int(width * scale), int(height * scale))
     return cv2.resize(image, new_size, interpolation=cv2.INTER_AREA)
-
 
 def analyze_image(image):
     growth = infer_growth_stage(image)
@@ -292,13 +294,12 @@ def analyze_image(image):
         "recommendations": recs,
     }
 
+    _, yolo_model = model_manager.load_models()
     if growth["main_class"] is None:
         if yolo_model is None:
             fallback_reason = "Growth stage model unavailable in this deployment."
         else:
-            fallback_reason = (
-                "Cotton growth stage could not be detected from the uploaded image."
-            )
+            fallback_reason = "Cotton growth stage could not be detected from the uploaded image."
 
         result["warnings"] = [
             fallback_reason,
@@ -307,22 +308,15 @@ def analyze_image(image):
 
     return result
 
-
 def encode_image_for_display(image):
     import base64
     display_image = resize_image(image, DISPLAY_IMAGE_MAX_DIMENSION)
     encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), DISPLAY_JPEG_QUALITY]
     _, buffer = cv2.imencode(".jpg", display_image, encode_params)
-    image_b64 = base64.b64encode(buffer).decode("utf-8")
-    return image_b64
-
+    return base64.b64encode(buffer).decode("utf-8")
 
 def is_allowed_image(filename):
-    return (
-        "." in filename
-        and filename.rsplit(".", 1)[1].lower() in ALLOWED_IMAGE_EXTENSIONS
-    )
-
+    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_IMAGE_EXTENSIONS
 
 def read_uploaded_image(file_storage):
     safe_filename = secure_filename(file_storage.filename)
@@ -332,7 +326,6 @@ def read_uploaded_image(file_storage):
         raise ValueError("Error reading image file")
     return safe_filename, image, cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-
 def build_comparison_result(old_results, new_results):
     if not isinstance(old_results, dict) or not isinstance(new_results, dict):
         raise ValueError("Comparison analysis did not produce valid result objects.")
@@ -340,9 +333,7 @@ def build_comparison_result(old_results, new_results):
     old_disease = old_results.get("disease")
     new_disease = new_results.get("disease")
     if old_disease is None or new_disease is None:
-        raise ValueError(
-            "Unable to compare the provided images because one or both images did not contain a valid cotton crop analysis."
-        )
+        raise ValueError("Unable to compare the provided images because one or both images did not contain a valid cotton crop analysis.")
 
     old_score = float(old_disease.get("health_score", 0.0))
     new_score = float(new_disease.get("health_score", 0.0))
@@ -350,30 +341,15 @@ def build_comparison_result(old_results, new_results):
     abs_change = abs(change)
 
     if change > 1:
-        trend = {
-            "status": "improved",
-            "label": "Improved",
-            "icon": "fa-arrow-trend-up",
-            "direction": "up",
-        }
+        trend = {"status": "improved", "label": "Improved", "icon": "fa-arrow-trend-up", "direction": "up"}
         headline = f"Crop health improved by {abs_change:.1f}%"
         recommendation = "Continue the current treatment plan, keep irrigation steady, and scout every few days to confirm the recovery trend."
     elif change < -1:
-        trend = {
-            "status": "declined",
-            "label": "Declined",
-            "icon": "fa-arrow-trend-down",
-            "direction": "down",
-        }
+        trend = {"status": "declined", "label": "Declined", "icon": "fa-arrow-trend-down", "direction": "down"}
         headline = f"Crop health declined by {abs_change:.1f}%"
         recommendation = "Increase field inspection frequency, isolate visibly affected plants, and consider expert guidance before the disease pressure spreads."
     else:
-        trend = {
-            "status": "stable",
-            "label": "Stable",
-            "icon": "fa-arrows-left-right",
-            "direction": "flat",
-        }
+        trend = {"status": "stable", "label": "Stable", "icon": "fa-arrows-left-right", "direction": "flat"}
         headline = "Crop health remained stable"
         recommendation = "Maintain the current crop care routine and compare again after the next treatment or irrigation cycle."
 
@@ -384,13 +360,7 @@ def build_comparison_result(old_results, new_results):
 
     summary = [
         headline,
-        "Disease spread reduced"
-        if disease_reduced
-        else (
-            f"Disease signal shifted from {old_predicted} to {new_predicted}"
-            if disease_changed
-            else f"Disease signal remains {new_predicted}"
-        ),
+        "Disease spread reduced" if disease_reduced else (f"Disease signal shifted from {old_predicted} to {new_predicted}" if disease_changed else f"Disease signal remains {new_predicted}"),
         recommendation,
     ]
 
@@ -407,7 +377,9 @@ def build_comparison_result(old_results, new_results):
         "summary": summary,
     }
 
-
+# -------------------------------------------------------------------
+# FLASK ROUTES
+# -------------------------------------------------------------------
 @app.after_request
 def add_no_cache_headers(response):
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
@@ -415,12 +387,10 @@ def add_no_cache_headers(response):
     response.headers["Expires"] = "0"
     return response
 
-
 @app.route("/")
 def index():
     lang = request.args.get("lang", "en")
     return render_template("index.html", text=LANG.get(lang, LANG["en"]), lang=lang)
-
 
 @app.route("/analyze", methods=["GET", "POST"])
 def analyze():
@@ -433,10 +403,7 @@ def analyze():
             flash("No file selected", "error")
             return redirect(request.url)
         if not is_allowed_image(file.filename):
-            flash(
-                "Invalid file type. Please upload an image (PNG, JPG, JPEG, GIF)",
-                "error",
-            )
+            flash("Invalid file type. Please upload an image (PNG, JPG, JPEG, GIF)", "error")
             return redirect(request.url)
         try:
             safe_filename, image, image_rgb = read_uploaded_image(file)
@@ -480,21 +447,13 @@ def analyze():
             return redirect(request.url)
     return render_template("upload.html")
 
-
 @app.route("/comparison", methods=["GET", "POST"])
 def comparison():
     error_message = None
-    old_filename = None
-    new_filename = None
-    old_image = None
-    new_image = None
+    old_filename, new_filename, old_image, new_image = None, None, None, None
 
     if request.method == "POST":
-        required_files = {
-            "last_week_image": "Last Week Field Image",
-            "current_week_image": "Current Week Field Image",
-        }
-
+        required_files = {"last_week_image": "Last Week Field Image", "current_week_image": "Current Week Field Image"}
         for field_name, label in required_files.items():
             if field_name not in request.files:
                 flash(f"{label} is required", "error")
@@ -504,30 +463,20 @@ def comparison():
                 flash(f"Please select a file for {label}", "error")
                 return redirect(request.url)
             if not is_allowed_image(uploaded_file.filename):
-                flash(
-                    f"Invalid file type for {label}. Please upload PNG, JPG, JPEG, or GIF.",
-                    "error",
-                )
+                flash(f"Invalid file type for {label}. Please upload PNG, JPG, JPEG, or GIF.", "error")
                 return redirect(request.url)
 
         try:
-            old_filename, old_image, old_rgb = read_uploaded_image(
-                request.files["last_week_image"]
-            )
-            new_filename, new_image, new_rgb = read_uploaded_image(
-                request.files["current_week_image"]
-            )
+            old_filename, old_image, old_rgb = read_uploaded_image(request.files["last_week_image"])
+            new_filename, new_image, new_rgb = read_uploaded_image(request.files["current_week_image"])
 
             old_results = analyze_image(old_rgb)
             new_results = analyze_image(new_rgb)
 
+            _, yolo_model = model_manager.load_models()
             if old_results.get("disease") is None or new_results.get("disease") is None:
                 error_message = "Unable to analyze one or both uploaded images. Please upload valid field images and try again."
-            elif (
-                old_results.get("warnings")
-                and new_results.get("warnings")
-                and yolo_model is not None
-            ):
+            elif old_results.get("warnings") and new_results.get("warnings") and yolo_model is not None:
                 error_message = "Unable to verify cotton crop in both images. Please upload clearer field photos with visible plants and try again."
 
             if error_message:
@@ -541,7 +490,6 @@ def comparison():
                 )
 
             comparison_result = build_comparison_result(old_results, new_results)
-
             return render_template(
                 "comparison.html",
                 old_results=old_results,
@@ -561,16 +509,10 @@ def comparison():
                 error_message=error_message,
                 old_filename=old_filename,
                 new_filename=new_filename,
-                old_image_b64=encode_image_for_display(old_image)
-                if old_image is not None
-                else None,
-                new_image_b64=encode_image_for_display(new_image)
-                if new_image is not None
-                else None,
+                old_image_b64=encode_image_for_display(old_image) if old_image is not None else None,
+                new_image_b64=encode_image_for_display(new_image) if new_image is not None else None,
             )
-
     return render_template("comparison.html")
-
 
 @app.route("/demo")
 def demo():
@@ -579,26 +521,13 @@ def demo():
         "predicted_class": "Healthy",
         "predicted_class_idx": 5,
         "confidence": example_disease_probs[5],
-        "all_confidences": {
-            disease_classes[i]: example_disease_probs[i]
-            for i in range(len(disease_classes))
-        },
+        "all_confidences": {disease_classes[i]: example_disease_probs[i] for i in range(len(disease_classes))},
         "health_score": 65.0,
         "raw": [example_disease_probs],
     }
     demo_growth_boxes = [
-        {
-            "class_id": 3,
-            "class_name": "Matured Cotton Boll",
-            "confidence": 0.91,
-            "bbox": [120, 80, 210, 155],
-        },
-        {
-            "class_id": 4,
-            "class_name": "Split Cotton Boll",
-            "confidence": 0.70,
-            "bbox": [300, 120, 390, 210],
-        },
+        {"class_id": 3, "class_name": "Matured Cotton Boll", "confidence": 0.91, "bbox": [120, 80, 210, 155]},
+        {"class_id": 4, "class_name": "Split Cotton Boll", "confidence": 0.70, "bbox": [300, 120, 390, 210]},
     ]
     demo_growth = {
         "main_class": "Matured Cotton Boll",
@@ -622,42 +551,8 @@ def demo():
         timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     )
 
-
 @app.route("/api/analyze", methods=["POST"])
 def api_analyze():
-    """
-    Analyze a cotton crop image for disease and growth stage.
-    ---
-    tags:
-      - API
-    consumes:
-      - multipart/form-data
-    parameters:
-      - name: file
-        in: formData
-        type: file
-        required: true
-        description: Upload the cotton crop image (PNG, JPG, JPEG, GIF) to be analyzed.
-    responses:
-      200:
-        description: Image analyzed successfully
-        schema:
-          type: object
-          properties:
-            status:
-              type: string
-              example: success
-            timestamp:
-              type: string
-              example: "2026-05-20T19:16:13.123456"
-            results:
-              type: object
-              description: Detailed analysis containing disease health score and growth stage boxes.
-      400:
-        description: Bad Request (No file uploaded, empty filename, or invalid image bytes)
-      500:
-        description: Internal Server Error during inference
-    """
     if "file" not in request.files:
         return jsonify({"error": "No file uploaded"}), 400
     file = request.files["file"]
@@ -670,44 +565,31 @@ def api_analyze():
             return jsonify({"error": "Invalid image file"}), 400
         image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         results = analyze_image(image_rgb)
-        return jsonify(
-            {
-                "status": "success",
-                "timestamp": datetime.now().isoformat(),
-                "results": results,
-            }
-        )
+        return jsonify({
+            "status": "success",
+            "timestamp": datetime.now().isoformat(),
+            "results": results,
+        })
     except Exception as e:
         logger.error(f"API analysis error: {e}")
         return jsonify({"error": str(e)}), 500
 
-
 @app.route("/health")
 def health():
-    """
-    Check the health status of the API and models.
-    ---
-    tags:
-      - API
-    responses:
-      200:
-        description: Returns the health status of the application and AI models.
-    """
-    model_loaded = resnet_model is not None and yolo_model is not None
-    return jsonify(
-        {
-            "status": "healthy",
-            "timestamp": datetime.now().isoformat(),
-            "model_loaded": model_loaded,
-            "service": "Agri-Vision Cotton Analysis API",
-        }
-    )
-
+    diagnostics = model_manager.diagnostics()
+    model_loaded = diagnostics["resnet"]["loaded"] and diagnostics["yolo"]["loaded"]
+    return jsonify({
+        "status": "healthy",
+        "mode": "ready" if model_loaded else "degraded",
+        "timestamp": datetime.now().isoformat(),
+        "model_loaded": model_loaded,
+        "models": diagnostics,
+        "service": "Agri-Vision Cotton Analysis API",
+    })
 
 @app.route("/set-language/<lang>")
 def set_language(lang):
     return redirect(url_for("index", lang=lang))
-
 
 @app.template_filter("datetimeformat")
 def datetimeformat_filter(value):
@@ -715,41 +597,16 @@ def datetimeformat_filter(value):
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     return value
 
-
 @app.route("/tutorials")
 def tutorials():
     return render_template("tutorials.html")
-
 
 @app.route("/stories")
 def stories():
     return render_template("stories.html")
 
-
 @app.route("/api/weather")
 def api_weather():
-    """
-    Get current weather data for a location.
-    ---
-    tags:
-      - API
-    parameters:
-      - name: lat
-        in: query
-        type: number
-        required: false
-      - name: lon
-        in: query
-        type: number
-        required: false
-      - name: city
-        in: query
-        type: string
-        required: false
-    responses:
-      200:
-        description: Weather data retrieved successfully
-    """
     lat = request.args.get("lat", type=float)
     lon = request.args.get("lon", type=float)
     city = request.args.get("city", type=str)
@@ -772,7 +629,6 @@ def api_weather():
     weather["weather_recommendations"] = generate_weather_recommendations(weather)
     return jsonify({"status": "success", "weather": weather})
 
-
 if __name__ == "__main__":
     logger.info("=" * 60)
     logger.info("Agri-Vision Cotton Analysis System")
@@ -787,6 +643,9 @@ if __name__ == "__main__":
     logger.info("/api/analyze   - API endpoint (POST)")
     logger.info("/health        - Health check")
     logger.info("=" * 60)
-    load_models()
+    
+    # Initialize models via the ModelManager
+    model_manager.load_models()
+    
     is_debug = os.getenv("FLASK_DEBUG", "False").lower() in ("true", "1", "t")
     app.run(debug=is_debug, host="0.0.0.0", port=5000)
