@@ -106,7 +106,7 @@ nav a[href="/model-admin"]:hover {
     opacity: 0.9;
     transform: translateY(-2px);
 }
-}
+
 
 [data-theme="dark"] {
     --cotton-white: #121212;
