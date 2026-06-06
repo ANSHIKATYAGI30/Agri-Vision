@@ -1691,7 +1691,21 @@ nav a[href="/model-admin"]:hover {
     .action-btn {
         width: 100%;
         justify-content: center;
+        min-height: 52px;
+        border-radius: 14px;
+        font-weight: 600;
+        letter-spacing: 0.3px;
+        transition: all 0.3s ease;
+        cursor: pointer;
         box-shadow: 0 10px 30px rgba(74, 144, 226, 0.2);
+    }
+
+    .action-btn:hover {
+        transform: translateY(-3px);
+    }
+
+    .action-btn i {
+        margin-right: 8px;
     }
 
     .info-grid {
